@@ -12,6 +12,7 @@ from outreach.models import (
     Candidate,
     Document,
     Draft,
+    FitAssessment,
     OutreachRequest,
     ProductProfile,
     Quality,
@@ -26,6 +27,8 @@ from outreach.research import (
     extract_report,
     public_url,
 )
+from outreach.signals import active_evidence, edit_signals, recipient_warnings
+from outreach.telemetry import observed_node
 
 
 class State(TypedDict, total=False):
@@ -53,6 +56,9 @@ class State(TypedDict, total=False):
     status: str
     review_error: str
     pending_approval: bool
+    removed_signals: list[dict]
+    fit: dict
+    quality_warnings: list[str]
 
 
 def word_count(body: str) -> int:
@@ -67,7 +73,12 @@ def context(state: State) -> dict:
         "product": state["product"],
         "company": state.get("company", {}),
         "selected": state.get("selected", []),
-        "evidence": [e for e in state.get("evidence", []) if e["id"] in selected_ids],
+        "evidence": [
+            e
+            for e in active_evidence(state.get("evidence", []), state.get("removed_signals", []))
+            if e["id"] in selected_ids
+        ],
+        "fit": state.get("fit", {}),
         "feedback": state.get("feedback", ""),
         "previous_draft": state.get("draft"),
         "repair_issues": state.get("quality_issues", []),
@@ -137,7 +148,10 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
     async def resolve_company(state: State):
         candidates = await research.resolve(OutreachRequest.model_validate(state["request"]))
         updates = {"candidates": [c.model_dump() for c in candidates], "phase": "Company identity"}
-        if len(candidates) == 1:
+        if (
+            len(candidates) == 1
+            and candidates[0].name.casefold() == state["request"]["company_name"].casefold()
+        ):
             updates["company"] = candidates[0].model_dump()
             return Command(update=updates, goto="research_company")
         return Command(update=updates, goto="company_review")
@@ -161,7 +175,13 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
             except ValueError as exc:
                 return Command(update={"review_error": str(exc)}, goto="company_review")
         if chosen:
-            return Command(update={"company": chosen, "review_error": ""}, goto="research_company")
+            updates = {"company": chosen, "review_error": ""}
+            if answer.source_url:
+                updates["request"] = {
+                    **state["request"],
+                    "company_url": public_url(answer.source_url),
+                }
+            return Command(update=updates, goto="research_company")
         return Command(
             update={"review_error": "Choose a company or enter its official website."},
             goto="company_review",
@@ -187,7 +207,9 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
         return {
             "company": report.company.model_dump(),
             "documents": [d.model_dump() for d in docs],
-            "evidence": [e.model_dump() for e in report.evidence],
+            "evidence": active_evidence(
+                [e.model_dump() for e in report.evidence], state.get("removed_signals", [])
+            ),
             "gaps": report.gaps,
             "selected": [],
             "requested_ids": [],
@@ -199,7 +221,9 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
         }
 
     async def select_signals(state: State):
-        evidence = eligible_evidence(state.get("evidence", []))
+        evidence = eligible_evidence(
+            active_evidence(state.get("evidence", []), state.get("removed_signals", []))
+        )
         requested = list(dict.fromkeys(state.get("requested_ids", [])))
         if requested:
             evidence = [e for e in evidence if e.id in requested]
@@ -236,14 +260,28 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
             ):
                 selected.append(signal)
         selected = selected[:2]
+        fit = selection.fit or FitAssessment(
+            company_fit="strong" if selected else "unknown",
+            recipient_fit="uncertain",
+            explanation="Recipient fit has not yet been assessed.",
+        )
+        if fit.company_fit != "strong":
+            selected = []
         selection.recommendations = selected
         updates = {
             "selection": selection.model_dump(),
             "phase": "Signal selection",
             "selected": [],
             "pending_approval": False,
+            "fit": fit.model_dump(),
+            "quality_warnings": recipient_warnings(fit.model_dump()),
         }
-        if not selected and state.get("research_window", 90) == 90 and not requested:
+        if (
+            not selected
+            and state.get("research_window", 90) == 90
+            and not requested
+            and not state.get("removed_signals")
+        ):
             return Command(update={**updates, "research_window": 365}, goto="research_company")
         if (
             state.get("confirming_selection")
@@ -263,7 +301,7 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
             )
         if state.get("confirming_selection"):
             updates["review_error"] = (
-                "Those signals do not all have a defensible product/recipient connection. Choose again or add evidence."
+                "Those signals do not all have a defensible company/product connection. Choose again or add evidence."
             )
         return Command(update=updates, goto="signal_review")
 
@@ -271,6 +309,11 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
         answer = review("signals", state)
         if answer.action == "cancel":
             return Command(update={"status": "cancelled"}, goto=END)
+        if answer.action in {"remove", "restore"}:
+            return Command(
+                update=edit_signals(state, answer.action, answer.evidence_ids),
+                goto="select_signals",
+            )
         if answer.action == "research":
             try:
                 supplied = add_source(state, answer)
@@ -321,6 +364,22 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
             Quality, CHECK, {**context(state), "draft": draft.model_dump()}
         )
         issues = list(quality.issues)
+        fit = quality.fit or FitAssessment.model_validate(
+            state.get("fit")
+            or {
+                "company_fit": "strong"
+                if quality.product_relevant and state.get("selected")
+                else "unknown",
+                "recipient_fit": "aligned" if quality.recipient_relevant else "uncertain",
+            }
+        )
+        warnings = list(quality.warnings) + recipient_warnings(fit.model_dump())
+        if not quality.recipient_relevant:
+            warnings.append(
+                "Recipient fit: this person may not be relevant to the purchasing decision; the email is based on company fit."
+            )
+        if fit.company_fit != "strong":
+            issues.append("The company does not have a defensible product fit.")
         req = OutreachRequest.model_validate(state["request"])
         count = word_count(draft.body)
         if not req.min_words <= count <= req.max_words:
@@ -328,7 +387,7 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
         selected_ids = {s["evidence_id"] for s in state["selected"]}
         if set(draft.evidence_ids) != selected_ids:
             issues.append("Draft must use exactly the human-approved signals.")
-        for key in ("grounded", "product_relevant", "recipient_relevant", "personalized"):
+        for key in ("grounded", "product_relevant", "personalized"):
             if not getattr(quality, key):
                 issues.append(f"Quality criterion failed: {key.replace('_', ' ')}.")
         updates = {
@@ -336,6 +395,8 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
             "quality_issues": list(dict.fromkeys(issues)),
             "phase": "Draft review",
             "review_error": "",
+            "quality_warnings": list(dict.fromkeys(warnings)),
+            "fit": fit.model_dump(),
         }
         if not issues and state.get("pending_approval"):
             return Command(update={**updates, "status": "approved", "phase": "Complete"}, goto=END)
@@ -351,6 +412,12 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
         answer = review("draft", state)
         if answer.action == "cancel":
             return Command(update={"status": "cancelled"}, goto=END)
+        if answer.action in {"remove", "restore"}:
+            updates = edit_signals(state, answer.action, answer.evidence_ids)
+            return Command(
+                update=updates,
+                goto="select_signals" if updates.get("draft") == {} else "draft_review",
+            )
         if answer.action == "signals":
             return Command(
                 update={
@@ -416,7 +483,7 @@ def build_graph(brain: Brain, research: ResearchProvider, checkpointer):
         "draft_review": draft_review,
     }
     for name, node in nodes.items():
-        graph.add_node(name, node)
+        graph.add_node(name, observed_node(name, node))
     graph.add_edge(START, "collect_inputs")
     graph.add_edge("research_company", "select_signals")
     graph.add_edge("draft_email", "check_quality")

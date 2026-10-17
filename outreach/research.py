@@ -6,8 +6,9 @@ import ipaddress
 import json
 import re
 from datetime import date, timedelta
+from time import perf_counter
 from typing import Protocol
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from outreach.brain import RESEARCH, RESOLVE, Brain
 from outreach.models import (
@@ -18,6 +19,42 @@ from outreach.models import (
     OutreachRequest,
     ResearchReport,
 )
+from outreach.telemetry import emit
+
+PLATFORM_HOSTS = {
+    "linkedin.com",
+    "facebook.com",
+    "instagram.com",
+    "x.com",
+    "twitter.com",
+    "crunchbase.com",
+    "wikipedia.org",
+}
+
+
+def platform_host(host: str) -> bool:
+    return any(host == site or host.endswith("." + site) for site in PLATFORM_HOSTS)
+
+
+def page_links(documents: list[Document], official_domain: str | None = None) -> list[str]:
+    links = []
+    for doc in documents:
+        for target in re.findall(r"\]\(([^\s)]+)", doc.content):
+            try:
+                url = public_url(urljoin(doc.url, target.strip("<>")))
+                if official_domain and domain(url) != official_domain:
+                    continue
+                if official_domain and not re.search(
+                    r"about|team|leadership|news|press|blog|article|insight|company",
+                    urlsplit(url).path,
+                    re.I,
+                ):
+                    continue
+                if url not in links and url != doc.url:
+                    links.append(url)
+            except ValueError:
+                continue
+    return links
 
 
 def public_url(value: str) -> str:
@@ -91,6 +128,9 @@ class MCPResearch:
         self.calls = 0
         self.gaps: list[str] = []
         self._tools = None
+        self._seeds: dict[str, list[Document]] = {}
+        self._seed_gaps: list[str] = []
+        self._reading_seed = False
 
     async def _call(self, name: str, args: dict):
         from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -100,6 +140,15 @@ class MCPResearch:
                 self.gaps.append("Research call budget reached (12 attempts this pass).")
                 return {}
             self.calls += 1
+            started = perf_counter()
+            activity = (
+                "searching"
+                if name.endswith("search")
+                else "reading_page"
+                if self._reading_seed
+                else "reading_sources"
+            )
+            emit(activity, attempt=attempt + 1)
             try:
                 async with asyncio.timeout(40):
                     if self._tools is None:
@@ -114,9 +163,17 @@ class MCPResearch:
                         )
                         self._tools = await client.get_tools()
                     tool = next(t for t in self._tools if t.name.replace("-", "_").endswith(name))
-                    return tool_payload(await tool.ainvoke(args))
+                    payload = tool_payload(await tool.ainvoke(args))
+                    emit(
+                        activity,
+                        "completed",
+                        duration_ms=round((perf_counter() - started) * 1000),
+                        count=len(payload.get("results", [])),
+                    )
+                    return payload
             except (TimeoutError, ConnectionError, OSError):
                 if attempt < 2:
+                    emit("retrying", attempt=attempt + 2)
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
             except Exception as exc:
@@ -125,9 +182,16 @@ class MCPResearch:
                 transient = status == 429 or (isinstance(status, int) and status >= 500)
                 transient |= type(exc).__name__ in {"ReadTimeout", "ConnectTimeout", "ConnectError"}
                 if transient and attempt < 2:
+                    emit("retrying", attempt=attempt + 2)
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
             self.gaps.append(f"{name} could not complete; retry research or supply a source.")
+            emit(
+                activity,
+                "failed",
+                duration_ms=round((perf_counter() - started) * 1000),
+                error_type="ResearchUnavailable",
+            )
             return {}
         return {}
 
@@ -193,17 +257,26 @@ class MCPResearch:
                 self.gaps.append("One source was inaccessible.")
         return documents
 
+    async def _starting_page(self, url):
+        url = public_url(url)
+        if url not in self._seeds:
+            self._reading_seed = True
+            try:
+                self._seeds[url] = await self._extract([url], [])
+            finally:
+                self._reading_seed = False
+        return self._seeds[url]
+
     async def resolve(self, request: OutreachRequest) -> list[Candidate]:
         self.calls = 0
+        docs = []
         if request.company_url:
-            return [
-                Candidate(
-                    name=request.company_name,
-                    domain=domain(request.company_url),
-                    description="Company website supplied by you",
-                )
-            ]
-        docs = await self._search(f'"{request.company_name}" official company website')
+            docs = await self._starting_page(request.company_url)
+            self._seed_gaps = list(self.gaps)
+            if not docs:
+                return []
+        if not docs or platform_host(domain(request.company_url)):
+            docs += await self._search(f'"{request.company_name}" official company website')
         if not docs:
             return []
         answer = await self.brain.complete(
@@ -214,12 +287,16 @@ class MCPResearch:
                 "results": [d.model_dump() for d in docs],
             },
         )
-        allowed_hosts = {domain(d.url) for d in docs}
+        allowed_hosts = {domain(d.url) for d in docs} | {domain(link) for link in page_links(docs)}
         candidates = []
         for candidate in answer.candidates:
             try:
                 host = domain(candidate.domain)
-                if host in allowed_hosts and host not in {c.domain for c in candidates}:
+                if (
+                    host in allowed_hosts
+                    and not platform_host(host)
+                    and host not in {c.domain for c in candidates}
+                ):
                     candidates.append(candidate.model_copy(update={"domain": host}))
             except ValueError:
                 continue
@@ -229,24 +306,35 @@ class MCPResearch:
         self.calls = 0
         self.gaps = [
             "LinkedIn coverage is limited to publicly accessible content; absence is not proof of no activity."
-        ]
+        ] + self._seed_gaps
         documents = list(supplied)
-        urls = [f"https://{company.domain}/"]
+        first_url = request.company_url or f"https://{company.domain}/"
+        seed = await self._starting_page(first_url)
+        documents.extend(seed)
+        related = page_links(seed, company.domain)
+        root = f"https://{company.domain}/"
+        if root != public_url(first_url):
+            related.append(root)
+        documents.extend(await self._extract(list(dict.fromkeys(related))[:3], []))
+        urls = []
         urls += [d.url for d in supplied if d.url and d.provenance == "search_snippet"]
         if request.recipient_url:
             urls.append(request.recipient_url)
-        documents.extend(await self._extract(list(dict.fromkeys(urls))[:4], []))
+        documents.extend(await self._extract(list(dict.fromkeys(urls))[:3], []))
         queries = [
-            f"site:{company.domain} about company founded employees leadership CEO",
-            f'"{company.name}" company news CEO announcement',
-            f'site:linkedin.com/posts "{company.name}" announcement award expansion',
-            f"site:{company.domain} blog news articles announcement",
-            f'"{request.recipient_name}" "{company.name}" "{request.recipient_role}" interview',
+            (f"site:{company.domain} about company founded employees leadership CEO", None),
+            (f"site:{company.domain} blog news articles announcement", window),
+            (f'"{company.name}" company news CEO announcement', window),
+            (f'site:linkedin.com/posts "{company.name}" announcement award expansion', window),
+            (
+                f'"{request.recipient_name}" "{company.name}" "{request.recipient_role}" interview',
+                window,
+            ),
         ]
-        for query in queries:
+        for query, days in queries:
             if self.calls >= 12:
                 break
-            snippets = await self._search(query, window)
+            snippets = await self._search(query, days)
             # Snippets aid discovery only. Only extracted text can support a signal.
             documents.extend(await self._extract([d.url for d in snippets[:2]], snippets))
         return deduplicate_documents(documents), list(dict.fromkeys(self.gaps))

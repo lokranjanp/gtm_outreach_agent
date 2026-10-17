@@ -13,6 +13,7 @@ from outreach.demo import DemoBrain, DemoResearch
 from outreach.models import OutreachRequest, ProductProfile, ReviewResponse
 from outreach.research import MCPResearch
 from outreach.storage import Store
+from outreach.telemetry import NODE_STAGES, configure_logging, emit, log_configuration, run_scope
 from outreach.workflow import build_graph
 
 
@@ -35,6 +36,7 @@ class Runner:
         self.store = store
         self.credentials = credentials or {}
         self.service_factory = service_factory
+        configure_logging(store.directory)
 
     def services(self, mode):
         if self.service_factory:
@@ -57,21 +59,62 @@ class Runner:
         return run_id
 
     async def _segment(
-        self, run_id, graph_input=None, progress: Callable | None = None, read_only=False
+        self,
+        run_id,
+        graph_input=None,
+        progress: Callable | None = None,
+        read_only=False,
+        reopen=False,
     ):
+        with run_scope(run_id):
+            return await self._execute_segment(run_id, graph_input, progress, read_only, reopen)
+
+    async def _execute_segment(self, run_id, graph_input, progress, read_only, reopen):
         run = self.store.run(run_id)
         brain, research = self.services(run["mode"])
         config = {"configurable": {"thread_id": run_id}, "recursion_limit": 80}
         async with AsyncSqliteSaver.from_conn_string(str(self.store.checkpoints)) as saver:
             graph = build_graph(brain, research, saver)
+            if reopen:
+                previous = await graph.aget_state(config)
+                if previous.values.get("status") != "approved":
+                    raise ValueError("Only an approved run can be reopened.")
+                await graph.aupdate_state(
+                    config,
+                    {
+                        "status": "running",
+                        "pending_approval": False,
+                        "requested_ids": [],
+                        "confirming_selection": False,
+                        "review_error": "",
+                    },
+                    as_node="research_company",
+                )
+                emit("reopened", "completed", stage=2)
             if not read_only:
+                last_event = {"stage": 0}
                 try:
-                    async for update in graph.astream(graph_input, config, stream_mode="updates"):
-                        if progress:
-                            for node in update:
-                                if node != "__interrupt__":
-                                    progress(node.replace("_", " ").capitalize())
-                except Exception:
+                    runtime = resolve_config(self.credentials)
+                    log_configuration(
+                        "demo" if run["mode"] == "demo" else runtime.provider,
+                        "offline" if run["mode"] == "demo" else runtime.model,
+                    )
+                    async for mode, update in graph.astream(
+                        graph_input, config, stream_mode=["updates", "custom"]
+                    ):
+                        if mode == "custom":
+                            last_event = update
+                            if progress:
+                                progress(update)
+                except Exception as exc:
+                    failed = emit(
+                        "failure",
+                        "failed",
+                        stage=last_event["stage"],
+                        error_type=type(exc).__name__,
+                    )
+                    if progress:
+                        progress(failed)
                     self.store.update_run(run_id, "error")
                     raise
             snapshot = await graph.aget_state(config)
@@ -89,6 +132,18 @@ class Runner:
                 self.store.update_run(
                     run_id, status, snapshot.values.get("request", {}).get("company_name")
                 )
+                next_node = snapshot.next[0] if snapshot.next else "check_quality"
+                final = emit(
+                    next_node,
+                    "waiting"
+                    if pauses
+                    else status
+                    if status in {"approved", "cancelled"}
+                    else "completed",
+                    stage=NODE_STAGES.get(next_node, 4),
+                )
+                if progress:
+                    progress(final)
             return result
 
     def start(self, run_id: str, request: OutreachRequest, product: ProductProfile, progress=None):
@@ -107,6 +162,8 @@ class Runner:
                     "evidence": [],
                     "repair_count": 0,
                     "review_error": "",
+                    "removed_signals": [],
+                    "quality_warnings": [],
                 },
                 progress,
             )
@@ -120,3 +177,6 @@ class Runner:
 
     def snapshot(self, run_id: str):
         return asyncio.run(self._segment(run_id, read_only=True))
+
+    def reopen(self, run_id: str, progress=None):
+        return asyncio.run(self._segment(run_id, progress=progress, reopen=True))

@@ -120,10 +120,18 @@ class Signal(Model):
     strength: Literal["strong", "weak"]
 
 
+class FitAssessment(Model):
+    company_fit: Literal["strong", "weak", "unknown"] = "unknown"
+    recipient_fit: Literal["aligned", "misaligned", "uncertain"] = "uncertain"
+    explanation: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
 class SignalSelection(Model):
     recommendations: list[Signal]
     rationale: str
     rejected_reasons: list[str]
+    fit: FitAssessment | None = None
 
 
 class Draft(Model):
@@ -138,10 +146,14 @@ class Quality(Model):
     recipient_relevant: bool
     personalized: bool
     issues: list[str]
+    warnings: list[str] = Field(default_factory=list)
+    fit: FitAssessment | None = None
 
 
 class ReviewResponse(Model):
-    action: Literal["approve", "revise", "signals", "research", "submit", "cancel", "retry"]
+    action: Literal[
+        "approve", "revise", "signals", "research", "submit", "cancel", "retry", "remove", "restore"
+    ]
     feedback: str = ""
     evidence_ids: list[str] = Field(default_factory=list)
     subject: str = ""

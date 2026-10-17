@@ -10,6 +10,7 @@ from outreach.models import (
     Draft,
     Evidence,
     Fact,
+    FitAssessment,
     ProductProfile,
     Quality,
     ResearchReport,
@@ -144,12 +145,23 @@ class DemoBrain:
         if schema is SignalSelection:
             row = SCENARIOS[data["company"]["name"]]
             ids = data.get("requested_ids") or [e["id"] for e in data["evidence"]][:1]
+            aligned = any(
+                word in data["request"]["recipient_role"].lower()
+                for word in ("financ", "procurement", "purchas", "cfo")
+            )
+            fit = FitAssessment(
+                company_fit="strong",
+                recipient_fit="aligned" if aligned else "misaligned",
+                explanation="The role aligns with purchasing coordination."
+                if aligned
+                else "The company fits purchasing coordination, but this role may not own finance or procurement.",
+            )
             return SignalSelection(
                 recommendations=[
                     Signal(
                         evidence_id=key,
                         product_connection=row["connection"],
-                        recipient_relevance=f"Purchasing coordination is relevant to the {data['request']['recipient_role']} role.",
+                        recipient_relevance=fit.explanation,
                         company_context=f"{row['industry']}; {row['size']}; founded {row['founded']}. {row['connection']}",
                         strength="strong",
                     )
@@ -159,17 +171,21 @@ class DemoBrain:
                 rejected_reasons=[
                     "Do not add another hook unless it strengthens this same purchasing angle."
                 ],
+                fit=fit,
             )
         if schema is Draft:
             req, product = data["request"], data["product"]
             row = SCENARIOS[data["company"]["name"]]
+            claims = " ".join(item["claim"] for item in data["evidence"])
+            hooks = [row[key] for key in ("hook", "second") if row[key] in claims]
+            primary_hook = hooks[0]
             first = req["recipient_name"].split()[0]
             name = product["name"].removesuffix(" (demo)")
-            opener = f"Hi {first},\n\nI saw that {data['company']['name']} {row['hook']}."
+            opener = f"Hi {first},\n\nI saw that {data['company']['name']} {primary_hook}."
             if req["previously_contacted"]:
                 opener += " I wanted to follow up with that development in mind."
-            if len(data["selected"]) == 2:
-                opener += f" I also noticed the company {row['second']}."
+            if len(hooks) == 2:
+                opener += f" I also noticed the company {hooks[1]}."
             pitch = f"{name} gives finance and procurement teams a shared place to route purchase approvals and track supplier onboarding."
             sentences = [
                 "How are you coordinating that work across the teams involved?",
@@ -192,7 +208,7 @@ class DemoBrain:
                 if len((body + " " + sentence + cta).split()) <= req["max_words"]:
                     body += " " + sentence
             if len((body + cta).split()) > req["max_words"]:
-                body = f"Hi {first},\n\nI saw that {data['company']['name']} {row['hook']}. "
+                body = f"Hi {first},\n\nI saw that {data['company']['name']} {primary_hook}. "
                 body += (
                     f"{name} routes purchase approvals and tracks supplier onboarding across teams."
                 )
@@ -212,15 +228,28 @@ class DemoBrain:
                 word in body
                 for word in ("guarantee", "50%", "ignore previous", "we met", "you replied")
             )
-            personalized = row["hook"].casefold() in body
-            if len(data["selected"]) == 2:
-                personalized = personalized and row["second"].casefold() in body
+            claims = " ".join(item["claim"] for item in data["evidence"])
+            hooks = [row[key] for key in ("hook", "second") if row[key] in claims]
+            personalized = bool(hooks) and all(hook.casefold() in body for hook in hooks)
             relevant = "approv" in body and "supplier" in body
+            fit = FitAssessment.model_validate(
+                data.get("fit")
+                or {
+                    "company_fit": "strong" if relevant else "weak",
+                    "recipient_fit": "aligned"
+                    if any(
+                        word in data["request"]["recipient_role"].lower()
+                        for word in ("financ", "procurement", "purchas", "cfo")
+                    )
+                    else "misaligned",
+                }
+            )
             return Quality(
                 grounded=grounded,
                 personalized=personalized,
                 product_relevant=relevant,
-                recipient_relevant=relevant,
+                recipient_relevant=fit.recipient_fit == "aligned",
+                fit=fit,
                 issues=[]
                 if grounded and personalized and relevant
                 else [

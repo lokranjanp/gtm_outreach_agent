@@ -55,6 +55,22 @@ Collect inputs → Resolve company → Research company → Select signals
 
 Each run has a stable thread ID and SQLite checkpoints. Open **Saved outreach** after a refresh or app restart to resume a pending review. Completed research is not repeated when a review resumes. Changing product profiles does not modify existing runs. Failed model/research steps retain earlier checkpoints and can be retried. Local SQLite data contains research, entered correspondence and draft history; it is excluded from git.
 
+## Progress, signal controls and recipient fit
+
+The stage tracker shows company identity, research, signal selection, drafting and review. It updates when steps and tool calls start, shows source counts and timings as operations finish, and explicitly waits for you at review gates. Saved runs restore the current review stage. These are operational activity updates, not hidden model reasoning.
+
+If you provide a company page URL, research reads that exact page first, including its path. It explores useful first-party About, leadership, newsroom and article links before external news and social searches. Public LinkedIn company pages can be starting sources; the official company website is resolved separately. Inaccessible or mismatched pages use the normal clarification flow.
+
+Use **Manage retrieved signals → Remove signal** during signal or draft review. Removal excludes the signal from this run and future research retries. **Removed signals → Restore signal** reverses it. Removing a signal used by the current email clears that draft and its approval and returns to signal selection. Earlier versions remain historical and are labeled outdated. Approved runs can be reopened for editing; reopening clears approval before changes are made.
+
+Company/product fit and recipient fit are assessed separately. A strong company fit can produce an email even if the named person is a weak or uncertain fit. The UI displays a recipient-fit warning outside the email, including after approval. The email pitches the company benefit without inventing the person's responsibility or switching the CTA to an introduction request. Weak company fit and unsupported role claims remain blocking issues.
+
+For appearance, use Streamlit's **⋮ menu → theme selector** to choose Light or Dark. Both native palettes are customized, and app elements inherit the selected theme.
+
+## Local operational logs
+
+INFO logs are written to the console and `<OUTREACH_DATA_DIR>/logs/outreach.log` (the project's `data/logs/outreach.log` by default). Files rotate at 5 MB with three backups. Logs contain run IDs, provider/model, stage transitions, timings, retry attempts, source counts and sanitized failure categories. They exclude API keys, headers, queries, source text, correspondence and email content. Logging handlers are reused across Streamlit reruns. The log directory is excluded from git along with local data.
+
 Research starts with 90 days and expands to 12 months when no useful hook is found. Each retrieval pass allows at most 12 tool attempts, including retries, with a 40-second timeout per attempt. Only extracted or user-supplied source content can support a signal; discovery snippets cannot. Model-proposed quotes must match their source text. Old roles, uncertain company matches, low-confidence claims, undated news and unsupported quotations are excluded. Evergreen website context is allowed, but must not be described as recent. There is no generic-draft fallback when the product connection is weak.
 
 Selection explains industry, employee size and company maturity without treating these attributes as proof of pain. The drafting prompt uses only approved signals and product claims. A separate model check assesses grounding and personalization; deterministic checks enforce word limits and approved evidence IDs. Two automatic repair attempts are allowed. Human edits are checked without being silently rewritten. These checks assist review; they cannot independently guarantee factual truth or email quality.
@@ -67,6 +83,7 @@ python -m ruff check .
 ```
 
 Tests run without network/API keys and exercise the actual LangGraph/SQLite resume flow, both human gates, ambiguity, sparse research, unsupported/stale signals, follow-up context, user edits, bounded repairs, snapshots and the Streamlit UI. Live calls are intentionally not made by the test suite.
+They also cover progress before operations finish, reversible exclusions across retries/restarts, outdated drafts, recipient-fit warnings, supplied-URL priority, log privacy/rotation and saved-checkpoint compatibility.
 
 For a live smoke test, use two real companies in different industries with valid keys: inspect source links and current roles, confirm each hook relates to the selected product, approve signals, revise the draft, restart the app at a review gate and confirm it resumes. API access and research coverage depend on your provider accounts.
 

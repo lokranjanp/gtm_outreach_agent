@@ -1,5 +1,7 @@
 """Streamlit presentation: evidence and decisions stay visible beside the email."""
 
+from html import escape
+
 import streamlit as st
 
 from outreach.config import CONFIG_NAMES, RuntimeConfig, resolve_config
@@ -7,27 +9,79 @@ from outreach.demo import DEMO_PRODUCT, SCENARIOS
 from outreach.models import LENGTHS, OutreachRequest, ProductProfile, ReviewResponse
 from outreach.research import eligible_evidence, public_url
 from outreach.runner import Runner
+from outreach.signals import active_evidence, recipient_warnings
 from outreach.storage import Store
+from outreach.telemetry import NODE_STAGES, STAGES
 from outreach.workflow import word_count
 
 CSS = """
 <style>
- .stApp { background: #fafbf9; }
  .block-container { padding-top: 4.5rem; max-width: 1250px; }
- [data-testid="stSidebar"] { background: #eef2ed; }
  h1, h2, h3 { letter-spacing: -.035em; }
- .eyebrow { color: #48775a; font-size: .78rem; font-weight: 700; letter-spacing: .15em; }
- .intro { color: #637064; font-size: 1.05rem; max-width: 740px; margin-bottom: 1.5rem; }
- [data-testid="stMetric"] { background: #f0f4ee; border-radius: 12px; padding: 16px; }
+ .eyebrow { opacity: .75; font-size: .78rem; font-weight: 700; letter-spacing: .15em; }
+ .intro { opacity: .8; font-size: 1.05rem; max-width: 740px; margin-bottom: 1.5rem; }
+ [data-testid="stMetric"] { border: 1px solid #8885; border-radius: 12px; padding: 16px; }
  [data-testid="stVerticalBlockBorderWrapper"] { border-radius: 12px; }
+ .workflow-flow { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 8px; margin: 12px 0 18px; }
+ .workflow-step { border: 1px solid currentColor; border-radius: 10px; padding: 12px; opacity: .45; font-size: .85rem; }
+ .workflow-step[data-state="running"], .workflow-step[data-state="waiting"] { opacity: 1; border-width: 2px; }
+ .workflow-step[data-state="completed"] { opacity: .85; }
+ .workflow-step[data-state="failed"] { opacity: 1; border: 2px solid #e86a64; }
+ .workflow-step small { display: block; margin-top: 5px; opacity: .8; }
+ @media(max-width:650px) { .workflow-flow { grid-template-columns: 1fr; } }
 </style>
 """
 
 
+def tracker_html(event):
+    active, status = event.get("stage", 0), event.get("status", "running")
+    cells = []
+    for index, label in enumerate(STAGES):
+        state = "completed" if index < active or status == "approved" else "pending"
+        if index == active and status != "approved":
+            state = status if status != "completed" or event.get("milestone") else "running"
+        icon = {
+            "completed": "✓",
+            "running": "◉",
+            "waiting": "◷",
+            "failed": "!",
+            "cancelled": "—",
+        }.get(state, "○")
+        text = "Waiting for you" if state == "waiting" else state.replace("_", " ").title()
+        cells.append(
+            f'<div class="workflow-step" data-state="{state}">{icon} {escape(label)}<small>{text}</small></div>'
+        )
+    return (
+        '<div class="workflow-flow" role="status" aria-live="polite">' + "".join(cells) + "</div>"
+    )
+
+
+def show_fit_warnings(state):
+    warnings = list(state.get("quality_warnings", [])) + recipient_warnings(state.get("fit"))
+    for warning in dict.fromkeys(warnings):
+        st.warning(warning)
+
+
 def execute(callback):
+    tracker = st.empty()
+    activity = st.empty()
+    tracker.markdown(tracker_html({"stage": 0, "status": "running"}), unsafe_allow_html=True)
     try:
         with st.status("Working on your outreach…", expanded=True) as status:
-            callback(lambda text: status.write(text))
+
+            def update(event):
+                tracker.markdown(tracker_html(event), unsafe_allow_html=True)
+                detail = event["activity"]
+                if event.get("count") is not None:
+                    detail += f" · {event['count']} sources"
+                if event.get("duration_ms") is not None:
+                    detail += f" · {event['duration_ms'] / 1000:.1f}s"
+                activity.caption(detail)
+                status.update(label=event["activity"])
+                if event["status"] != "running":
+                    status.write(f"{event['activity']} · {event['status']}")
+
+            callback(update)
             status.update(label="Saved — ready for your review", state="complete", expanded=False)
     except Exception:
         # Provider exceptions can contain credentials and source content. Do not render them.
@@ -130,7 +184,10 @@ def new_page(store, runner, config: RuntimeConfig):
         product = st.selectbox("Product *", products, format_func=lambda p: p.name)
         col1, col2 = st.columns(2)
         company = col1.text_input("Company name *", value=scenario if demo else "")
-        website = col2.text_input("Company website (optional)")
+        website = col2.text_input(
+            "Company page URL (optional)",
+            help="Official website or a public company page. Research starts from this exact URL.",
+        )
         name = col1.text_input("Recipient name *", value=sample["recipient"] if demo else "")
         role = col2.text_input("Recipient role *", value=sample["role"] if demo else "")
         profile = st.text_input("Recipient profile URL (optional)")
@@ -314,6 +371,7 @@ def company_review(runner, run_id, pause):
 
 def signal_review(runner, run_id, state):
     st.subheader("Choose the reason to reach out")
+    show_fit_warnings(state)
     selection = state.get("selection", {})
     st.write(selection.get("rationale", ""))
     recommendations = selection.get("recommendations", [])
@@ -366,10 +424,42 @@ def signal_review(runner, run_id, state):
                     progress,
                 )
             )
+    signal_controls(runner, run_id, state)
+
+
+def signal_controls(runner, run_id, state):
+    with st.expander("Manage retrieved signals"):
+        st.caption(
+            "Removed signals stay excluded from this run after research retries. You can restore them below."
+        )
+        for item in active_evidence(state.get("evidence", []), state.get("removed_signals", [])):
+            left, right = st.columns([4, 1])
+            left.write(item["title"])
+            left.caption(item["claim"])
+            if right.button("Remove signal", key=f"remove_{run_id}_{item['id']}"):
+                execute(
+                    lambda progress, key=item["id"]: runner.resume(
+                        run_id, ReviewResponse(action="remove", evidence_ids=[key]), progress
+                    )
+                )
+    removed = state.get("removed_signals", [])
+    with st.expander(f"Removed signals ({len(removed)})"):
+        for entry in removed:
+            item = entry["signal"]
+            left, right = st.columns([4, 1])
+            left.write(item["title"])
+            left.caption(item["claim"])
+            if right.button("Restore signal", key=f"restore_{run_id}_{item['id']}"):
+                execute(
+                    lambda progress, key=item["id"]: runner.resume(
+                        run_id, ReviewResponse(action="restore", evidence_ids=[key]), progress
+                    )
+                )
 
 
 def draft_review(runner, run_id, state):
     st.subheader("Make it sound like you")
+    show_fit_warnings(state)
     draft = state["draft"]
     for issue in state.get("quality_issues", []):
         st.warning(issue)
@@ -405,6 +495,7 @@ def draft_review(runner, run_id, state):
             evidence_card(by_id[signal["evidence_id"]], True)
             st.write(signal["product_connection"])
             st.caption(signal["recipient_relevance"])
+    signal_controls(runner, run_id, state)
 
 
 def run_page(store, runner, config: RuntimeConfig):
@@ -438,6 +529,21 @@ def run_page(store, runner, config: RuntimeConfig):
             "This run did not start successfully. Create a new outreach with the same inputs."
         )
         return
+    next_node = snapshot["next"][0] if snapshot["next"] else "check_quality"
+    state_status = state.get("status", "running")
+    display_status = (
+        "failed"
+        if run["status"] == "error"
+        else "waiting"
+        if pauses
+        else state_status
+        if state_status in {"approved", "cancelled"}
+        else "running"
+    )
+    st.markdown(
+        tracker_html({"stage": NODE_STAGES.get(next_node, 4), "status": display_status}),
+        unsafe_allow_html=True,
+    )
     research_panel(state)
     if pauses:
         pause = pauses[0]
@@ -453,12 +559,15 @@ def run_page(store, runner, config: RuntimeConfig):
         cancel_button(runner, run_id)
     elif state.get("status") == "approved":
         st.success("Approved — ready to copy or download.")
+        show_fit_warnings(state)
         draft = state["draft"]
         email = f"Subject: {draft['subject']}\n\n{draft['body']}"
         st.code(email, language=None, wrap_lines=True)
         st.download_button(
             "Download approved email", email, file_name="outreach-email.txt", mime="text/plain"
         )
+        if st.button("Reopen for editing"):
+            execute(lambda progress: runner.reopen(run_id, progress))
     elif state.get("status") == "cancelled":
         st.info("This run was cancelled. Its research and history are retained.")
     elif snapshot["next"]:
@@ -468,6 +577,10 @@ def run_page(store, runner, config: RuntimeConfig):
     with st.expander(f"Draft history ({len(state.get('versions', []))})"):
         for index, version in enumerate(state.get("versions", []), 1):
             st.caption(f"Version {index} · {version['origin']} · {version['created_at'][:19]}")
+            if version.get("outdated"):
+                st.caption(
+                    "Outdated: this version used a signal that was removed. Historical reference only."
+                )
             st.write(version["draft"]["subject"])
             st.text(version["draft"]["body"])
     with st.expander("Product profile used for this run"):
@@ -509,6 +622,7 @@ def main():
             "Live research " + ("is configured ✓" if config.ready else "needs configuration")
         )
         st.caption("Local storage · Human reviewed · Drafts only")
+        st.caption("Appearance: open the ⋮ menu at the top right to choose Light or Dark.")
     if page == "Product library":
         product_page(store)
     elif page == "New outreach":
